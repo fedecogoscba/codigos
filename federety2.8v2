@@ -405,22 +405,28 @@ for (int i = 0; i < devCount; ++i) {
     Serial.println(": address no obtenida");
   }
 }
+
 // Cargar address guardada de chimenea (si existe)
 String savedChim = prefs.getString("chimAddr", "");
 if (savedChim.length() == 16 && hexToAddress(savedChim, chimAddr)) {
   // verificar que el addr está presente en bus en este arranque
-  bool found = false;
+  int chimIndexFound = -1;
   for (int i = 0; i < devCount; ++i) {
     if (sensors.getAddress(tmpAddr, i)) {
       bool same = true;
-      for (uint8_t j=0;j<8;j++) if (tmpAddr[j] != chimAddr[j]) { same=false; break; }
-      if (same) { found = true; break; }
+      for (uint8_t j = 0; j < 8; j++) {
+        if (tmpAddr[j] != chimAddr[j]) { same = false; break; }
+      }
+      if (same) { chimIndexFound = i; break; }
     }
   }
-  if (found) {
+  if (chimIndexFound >= 0) {
     chimAddrValid = true;
+    chimneyIndex = chimIndexFound; // <-- asignar el índice aquí
     Serial.print("Chimenea: address cargada de prefs: ");
-    char h[17]; addressToHex(chimAddr,h); Serial.println(h);
+    char h[17]; addressToHex(chimAddr, h); Serial.println(h);
+    Serial.print("Chimenea: index asignado: ");
+    Serial.println(chimneyIndex);
   } else {
     Serial.println("Chimenea: address guardada NO encontrada en bus. Requiere reasignar.");
   }
@@ -933,18 +939,25 @@ void checkTelegramMessages() {
       }
     }
 
-        else if (msg == "/chimstatus") {
-      char buf[160];
-      if (chimneyIndex < 0) {
-        sendTelegramMessage("🔍 Sensor chimenea NO detectado.");
-      } else {
-        snprintf(buf, sizeof(buf), "🌡️ Chimenea: %.1f °C\nSetpoint: %.1f °C\nOverride: %s",
-          isnan(chimneyTemp) ? NAN : chimneyTemp,
-          chimneySetpoint,
-          chimneyOverrideActive ? "ACTIVO" : "INACTIVO");
-        sendTelegramMessage(buf);
-      }
+    else if (msg == "/chimstatus") {
+  char buf[160];
+  // Comprobar tanto chimAddrValid (address) como chimneyIndex (fallback por índice)
+  if (!chimAddrValid && chimneyIndex < 0) {
+    sendTelegramMessage("🔍 Sensor chimenea NO detectado.");
+  } else {
+    char tempStr[32];
+    if (isnan(chimneyTemp)) {
+      snprintf(tempStr, sizeof(tempStr), "N/A");
+    } else {
+      snprintf(tempStr, sizeof(tempStr), "%.1f °C", chimneyTemp);
     }
+    snprintf(buf, sizeof(buf), "🌡️ Chimenea: %s\nSetpoint: %.1f °C\nOverride: %s",
+      tempStr,
+      chimneySetpoint,
+      chimneyOverrideActive ? "ACTIVO" : "INACTIVO");
+    sendTelegramMessage(buf);
+  }
+}    
       
     // RELE OFF
      else if (msg == "/rele_off") {
