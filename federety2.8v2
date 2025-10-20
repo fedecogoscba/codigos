@@ -1,0 +1,1032 @@
+// --- LIBRERÍAS ---
+#include <WiFi.h>            // Conexión WiFi
+#include <HTTPClient.h>      // Cliente HTTP para Telegram / APIs
+#include <ArduinoJson.h>
+#include <max6675.h>         // Conversor MAX6675 (termocupla)
+#include <Preferences.h>     // NVS (guardar lastUpdateId)
+#include <OneWire.h>         // Bus OneWire para DS18B20
+#include <DallasTemperature.h>// Librería para DS18B20
+
+// --- PINES / HARDWARE ---
+#define LED_PILOTO_APAGADO 22   // LED verde: piloto APAGADO (tu convención)
+#define LED_PILOTO_ENCENDIDO 21 // LED rojo: piloto ENCENDIDO
+#define LED_WIFI 19             // LED estado WiFi
+
+#define ONE_WIRE_BUS 18         // pin digital donde conectás la data del DS18B20
+
+const int thermoDO = 5;         // MISO / SO del MAX6675
+const int thermoCS = 4;         // CS del MAX6675
+const int thermoCLK = 2;        // SCK del MAX6675
+
+// --- CREDENCIALES / CONFIGURACIÓN ---
+#include "config_private.h"
+
+// --- PERSISTENCIA / ESTADO ---
+Preferences prefs;            // objeto NVS para persistir lastUpdateId
+int32_t lastUpdateId = 0;     // último update_id procesado (persistido en prefs)
+
+// --- OBJETOS / SENSORES ---
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO); // objeto MAX6675
+OneWire oneWire(ONE_WIRE_BUS);       // bus 1-wire
+DallasTemperature sensors(&oneWire); // controlador DS18B20
+
+// --- VARIABLES COMPARTIDAS POR TAREAS ---
+float ds18b20Temp = NAN;       // temperatura ambiente (DS18B20)
+float ds18b20Offset = 0.0;     // offset de calibración opcional
+int dsFaultCount = 0;          // contador fallos DS18B20
+
+float termocoupleTemp = NAN;   // lectura MAX6675 (termocupla)
+int thermoFaultCount = 0;      // contador fallos termocupla
+
+float thresholdLow = 60.0;     // umbral bajo (piloto)  — ajustar si hace falta
+float thresholdHigh = 61.0;    // umbral alto (histeresis)
+TaskHandle_t handleDS18B20 = NULL;
+
+// OneWire mutex para proteger el bus DS18B20 (FreeRTOS)
+SemaphoreHandle_t oneWireMutex = NULL;
+
+// Direcciones ROM (DeviceAddress) para lectura robusta
+// Ambient (Index 0)  ROM: 28ADB745D47D0191
+DeviceAddress ambientAddr = { 0x28, 0xAD, 0xB7, 0x45, 0xD4, 0x7D, 0x01, 0x91 };
+// Chimenea (Index 1) ROM: 28670645D46B7FE2
+DeviceAddress chimAddr    = { 0x28, 0x67, 0x06, 0x45, 0xD4, 0x6B, 0x7F, 0xE2 };
+// Flags de validez
+bool ambAddrValid = true;
+bool chimAddrValid = true;
+
+// Forzar que no use fallback por índice (evita confusión)
+// chimneyIndex = -1;
+//
+//
+
+
+// --- SENSOR CHIMENEA (DS18B20 adicional) / OVERRIDE ---
+int chimneyIndex = -1;                     // índice del device DS18B20 en el bus (si hay más de 1)
+float chimneyTemp = NAN;                   // temperatura leída en la chimenea
+float chimneySetpoint = 10.0;              // setpoint por defecto para la chimenea (°C). /chimset lo actualizará.
+
+// Override: forzar caldera ENCENDIDA por un tiempo
+bool chimneyOverrideActive = false;
+unsigned long chimneyOverrideUntil = 0;    // millis() hasta cuando está activo el override
+unsigned long chimneyOverrideDurationMs = 5UL * 60UL * 1000UL; // 5 minutos por defecto (configurable)
+
+// --- ESTADOS / FLAGS ---
+bool pilotoApagado = false;    // true = piloto detectado como APAGADO
+bool messageSent = false;      // evita envio repetido
+bool ultimoEstadoPiloto;       // se inicializa en setup()
+
+// --- LÍMITES DE MENSAJES / RATE LIMITING ---
+unsigned long lastMsgSentMillis = 0;
+const unsigned long MSG_MIN_INTERVAL_MS = 30UL * 1000UL; // evitar spam: 30 seg entre avisos automáticos
+
+// --- PIN RELÉ (para control  vía driver) ---
+const int RELAY_DRIVER_PIN = 23; // pin de control del opto-driver / mosfet (ejemplo)
+
+// --- ESTADO DE TERMOCUPLA ---
+bool termocuplaDesconectadaAnterior = false; // Estado previo de la termocupla
+bool mensajeErrorTermocuplaEnviado = false;   // Para evitar mensajes repetidos
+
+// --- WiFi reconexión y notificación ---
+unsigned long lastWiFiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 10000; // cada 10 segundos
+bool wifiWasConnected = false;
+const unsigned long WIFI_MANUAL_TIMEOUT = 120000; // 2 minutos
+unsigned long wifiLostSince = 0;
+bool modoManualPorWiFi = false;
+
+// --- CONTROL DE TERMOSTATO Y RELÉ ---
+float setpointTemp = NAN;      // Setpoint indefinido al inicio
+float histeresis = 0.5;        // Histeresis para evitar ciclos rápidos
+bool releOn = true;            // por seguridad, al inicio la caldera esta encendida
+bool automatico = false;       // Modo automático solo activo tras /set XX.X
+
+const int FAULT_THRESHOLD = 5;// cuántos fallos seguidos antes de marcar error
+
+// --- Declaración anticipada ---
+void checkWiFiAndNotify();
+void checkTelegramMessages();
+void controlarRele();
+
+// --- Filtro software para la lectura del MAX6675 (mayoría de N muestras y rango físico) ---
+// --- Filtro mejorado con mediana (más robusto contra lecturas erróneas) ---
+float filtroTermocupla(int muestras = 5) {
+  float lecturas[5];
+  int validas = 0;
+  
+  for (int i = 0; i < muestras; ++i) {
+    delay(250);  // ⚠️ CRÍTICO: 250ms mínimo para conversión MAX6675
+    float t = thermocouple.readCelsius();
+    // Filtrado físico de rango
+    if (!isnan(t) && t >= -5.0 && t <= 600.0) {
+      lecturas[validas++] = t;
+    }
+  }
+  // Mínimo 3 de 5 lecturas válidas
+  if (validas < 3) return NAN;
+  // Ordenar para obtener mediana (valor central)
+  for (int i = 0; i < validas - 1; i++) {
+    for (int j = i + 1; j < validas; j++) {
+      if (lecturas[i] > lecturas[j]) {
+        float temp = lecturas[i];
+        lecturas[i] = lecturas[j];
+        lecturas[j] = temp;
+      }
+    }
+  }
+  // Devolver mediana
+  return lecturas[validas / 2];
+}
+
+// Convierte DeviceAddress a hex string (16 chars + '\0')
+void addressToHex(const DeviceAddress addr, char *out /* >=17 */) {
+  for (uint8_t i=0; i<8; ++i) sprintf(&out[i*2], "%02X", addr[i]);
+  out[16] = '\0';
+}
+
+// Convierte hex string (16 chars) a DeviceAddress; devuelve true si OK
+bool hexToAddress(const String &hex, DeviceAddress addr) {
+  if (hex.length() != 16) return false;
+  for (uint8_t i=0; i<8; ++i) {
+    String b = hex.substring(i*2, i*2+2);
+    addr[i] = (uint8_t) strtoul(b.c_str(), NULL, 16);
+  }
+  return true;
+}
+
+// ------------------ FUNCIÓN AUXILIAR: URL-ENCODE (para texto en la URL) ------------------
+String urlEncode(const String &str) {
+  const char hex[] = "0123456789ABCDEF";
+  String encoded = "";
+  for (size_t i = 0; i < str.length(); ++i) {
+    uint8_t c = (uint8_t)str[i];
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += (char)c;
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
+  }
+  return encoded;
+}
+
+// ------------------ FUNCIÓN PARA ENVIAR MENSAJE TELEGRAM ------------------
+void sendTelegramMessage(const char* text) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No hay WiFi, no se pudo enviar mensaje");
+    return;
+  }
+  String encodedText = urlEncode(text);
+  String url = String("https://api.telegram.org/bot") + String(botToken)
+               + "/sendMessage?chat_id=" + String(chatID)
+               + "&text=" + encodedText;
+
+  int maxRetries = 2;
+  int httpResponseCode = 0;
+  HTTPClient http;
+  for (int attempt = 0; attempt < maxRetries; ++attempt) {
+    http.begin(url);
+    httpResponseCode = http.GET();
+    http.end();
+    if (httpResponseCode > 0) break;
+    delay(500);
+  }
+
+  if (httpResponseCode > 0) {
+    Serial.print("Mensaje enviado a Telegram. HTTP code: ");
+    Serial.println(httpResponseCode);
+  } else {
+    Serial.print("Error en HTTP al enviar mensaje, code: ");
+    Serial.println(httpResponseCode);
+  }
+}
+
+// --- TAREA DS18B20 ---
+//  tareaDS18B20 actualizada (uso de mutex y lectura por address) ----------
+void tareaDS18B20(void * parameter) {
+  for(;;) {
+    // Tomar mutex para acceder al bus OneWire (timeout razonable)
+    if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
+      sensors.requestTemperatures(); // conversión para todos los sensores
+
+      // Lectura AMBIENTE (por address fijo)
+      if (ambAddrValid) {
+        float d = sensors.getTempC(ambientAddr);
+        if (d == DEVICE_DISCONNECTED_C || isnan(d)) {
+          dsFaultCount++;
+          ds18b20Temp = NAN;
+          Serial.println("DS18B20: lectura INVALIDA [FreeRTOS] (amb by addr)");
+        } else {
+          dsFaultCount = 0;
+          ds18b20Temp = d + ds18b20Offset;
+          Serial.print("DS18B20 [FreeRTOS,addr]: ");
+          Serial.print(ds18b20Temp, 1);
+          Serial.println(" °C");
+        }
+      } else {
+        // fallback si decidieras no usar direcciones (no recomendado)
+        float d = sensors.getTempCByIndex(0);
+        if (d == DEVICE_DISCONNECTED_C || isnan(d)) {
+          dsFaultCount++;
+          ds18b20Temp = NAN;
+          Serial.println("DS18B20: lectura INVALIDA [FreeRTOS] (amb by idx)");
+        } else {
+          dsFaultCount = 0;
+          ds18b20Temp = d + ds18b20Offset;
+          Serial.print("DS18B20 [FreeRTOS,idx0]: ");
+          Serial.print(ds18b20Temp, 1);
+          Serial.println(" °C");
+        }
+      }
+
+      // Lectura CHIMENEA (por address fijo)
+      if (chimAddrValid) {
+        float c = sensors.getTempC(chimAddr);
+        if (c == DEVICE_DISCONNECTED_C || isnan(c)) {
+          Serial.println("Chimenea: lectura INVALIDA [FreeRTOS]");
+          chimneyTemp = NAN;
+        } else {
+          chimneyTemp = c;
+          Serial.print("Chimenea [FreeRTOS,addr]: ");
+          Serial.print(chimneyTemp, 1);
+          Serial.println(" °C");
+        }
+      } else if (chimneyIndex >= 0) {
+        // fallback por índice si no hay address (temporal)
+        float c = sensors.getTempCByIndex(chimneyIndex);
+        if (c == DEVICE_DISCONNECTED_C || isnan(c)) {
+          Serial.println("Chimenea: lectura INVALIDA [FreeRTOS] (idx)");
+          chimneyTemp = NAN;
+        } else {
+          chimneyTemp = c;
+          Serial.print("Chimenea [FreeRTOS,idx]: ");
+          Serial.print(chimneyTemp, 1);
+          Serial.println(" °C");
+        }
+      } else {
+        chimneyTemp = NAN;
+      }
+
+      xSemaphoreGive(oneWireMutex); // liberar mutex
+    } else {
+      Serial.println("Warning: timeout al tomar mutex OneWire en tareaDS18B20");
+    }
+
+    // --- Lógica override chimenea (activación y notificación) ---
+    if ((chimAddrValid || chimneyIndex >= 0) && !chimneyOverrideActive) {
+      if (!isnan(chimneyTemp) && chimneyTemp < chimneySetpoint) {
+        chimneyOverrideActive = true;
+        chimneyOverrideUntil = millis() + chimneyOverrideDurationMs;
+
+        // Forzar caldera ENCENDIDA (override)
+        releOn = false;
+        digitalWrite(RELAY_DRIVER_PIN, HIGH);
+
+        char msg[160];
+        unsigned long min = chimneyOverrideDurationMs / 60000UL;
+        snprintf(msg, sizeof(msg),
+          "🔥 OVERRIDE CHIMENEA activado: temp salida %.1f°C < set %.1f°C. Caldera ENCENDIDA por %lu min.",
+          chimneyTemp, chimneySetpoint, min);
+        sendTelegramMessage(msg);
+        Serial.println(msg);
+      }
+    }
+
+    // Actualizar control del relé (chequea override dentro de controlarRele)
+    controlarRele();
+
+    vTaskDelay(2000 / portTICK_PERIOD_MS); // Espera 2s entre lecturas
+  }
+}
+
+// --- TAREA MAX6675 ---
+void tareaMAX6675(void * parameter) {
+  for(;;) {
+    float t = filtroTermocupla(5);
+    if (!isnan(t)) {
+      thermoFaultCount = 0;
+      termocoupleTemp = t;
+      Serial.print("MAX6675 [FreeRTOS]: ");
+      Serial.print(termocoupleTemp, 1);
+      Serial.println(" °C");
+    } else {
+      thermoFaultCount++;
+      termocoupleTemp = NAN;
+      Serial.println("MAX6675: lectura INVALIDA [FreeRTOS]");
+    }
+    vTaskDelay(2500 / portTICK_PERIOD_MS); // Espera 2.5s entre lecturas
+  }
+}
+
+void setup() {
+  Serial.begin(9600); // arranca la consola serie (debug)
+
+  // Crear mutex OneWire
+  oneWireMutex = xSemaphoreCreateMutex();
+  if (oneWireMutex == NULL) {
+  Serial.println("ERROR: no se pudo crear mutex OneWire");
+  }
+
+  // LEDs indicadores: arrancan apagados hasta comprobar estado
+  pinMode(LED_PILOTO_APAGADO, OUTPUT);        
+  digitalWrite(LED_PILOTO_APAGADO, LOW);      // LED verde (piloto apagado) OFF
+  pinMode(LED_PILOTO_ENCENDIDO, OUTPUT);
+  digitalWrite(LED_PILOTO_ENCENDIDO, LOW);    // LED rojo (piloto encendido) OFF
+  pinMode(LED_WIFI, OUTPUT);
+  digitalWrite(LED_WIFI, LOW);                // LED WiFi OFF
+
+  // Relé NC: caldera encendida por defecto
+  pinMode(RELAY_DRIVER_PIN, OUTPUT);
+  digitalWrite(RELAY_DRIVER_PIN, HIGH); // Relé ON (NC cerrado, caldera encendida)
+  releOn = false;
+  automatico = false;
+  setpointTemp = NAN;
+
+  // --- NVS (Preferences) -> cargar lastUpdateId ---
+  prefs.begin("tg", false);                    
+  lastUpdateId = prefs.getInt("lastId", 0);
+
+  // --- Conectar a WiFi ---
+  WiFi.begin(ssid, password);                  
+  Serial.print("Conectando a WiFi...");
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+    delay(250);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi conectado");
+    digitalWrite(LED_WIFI, HIGH);
+    wifiWasConnected = true;
+    delay(300);
+  } else {
+    Serial.println("\nNo se pudo conectar a WiFi (continuamos en modo degradado)");
+    digitalWrite(LED_WIFI, LOW);
+    wifiWasConnected = false;
+  }
+  
+  // --- Iniciar buses / librerías de sensores ---
+  sensors.begin();
+  delay(50);
+
+  // --- Lectura inicial DS18B20 ---
+  sensors.requestTemperatures();
+  ds18b20Temp = sensors.getTempCByIndex(0);
+
+  if (isnan(ds18b20Temp) || ds18b20Temp == DEVICE_DISCONNECTED_C) {
+    dsFaultCount++;
+    Serial.println("DS18B20: lectura INVALIDA (inicial)");
+  } else {
+    dsFaultCount = 0;
+    Serial.print("DS18B20 (inicial): ");
+    Serial.print(ds18b20Temp, 1);
+    Serial.println(" °C");
+  }
+  
+    // Listar direcciones ROM en arranque
+DeviceAddress tmpAddr;
+int devCount = sensors.getDeviceCount();
+Serial.print("Detectados DS18B20 en bus: ");
+Serial.println(devCount);
+for (int i = 0; i < devCount; ++i) {
+  if (sensors.getAddress(tmpAddr, i)) {
+    char hex[17];
+    addressToHex(tmpAddr, hex);
+    Serial.print("Index ");
+    Serial.print(i);
+    Serial.print(": ");
+    Serial.println(hex);
+  } else {
+    Serial.print("Index ");
+    Serial.print(i);
+    Serial.println(": address no obtenida");
+  }
+}
+// Cargar address guardada de chimenea (si existe)
+String savedChim = prefs.getString("chimAddr", "");
+if (savedChim.length() == 16 && hexToAddress(savedChim, chimAddr)) {
+  // verificar que el addr está presente en bus en este arranque
+  bool found = false;
+  for (int i = 0; i < devCount; ++i) {
+    if (sensors.getAddress(tmpAddr, i)) {
+      bool same = true;
+      for (uint8_t j=0;j<8;j++) if (tmpAddr[j] != chimAddr[j]) { same=false; break; }
+      if (same) { found = true; break; }
+    }
+  }
+  if (found) {
+    chimAddrValid = true;
+    Serial.print("Chimenea: address cargada de prefs: ");
+    char h[17]; addressToHex(chimAddr,h); Serial.println(h);
+  } else {
+    Serial.println("Chimenea: address guardada NO encontrada en bus. Requiere reasignar.");
+  }
+} else {
+  Serial.println("No hay address de chimenea en prefs.");
+}
+
+  // --- Lectura inicial termocupla (MAX6675) ---
+  termocoupleTemp = thermocouple.readCelsius();
+  if (isnan(termocoupleTemp)) {
+    thermoFaultCount++;
+    Serial.println("MAX6675: lectura INVALIDA (termocupla desconectada?)");
+    sendTelegramMessage("⚠️ ERROR: Termocupla (MAX6675) no responde");
+    termocuplaDesconectadaAnterior = true;
+    mensajeErrorTermocuplaEnviado = true;
+  } else {
+    thermoFaultCount = 0;
+    Serial.print("MAX6675 (inicial): ");
+    Serial.print(termocoupleTemp, 1);
+    Serial.println(" °C");
+    termocuplaDesconectadaAnterior = false;
+    mensajeErrorTermocuplaEnviado = false;
+  }
+
+  // --- Estado inicial del piloto (basado en termocupla) ---
+  if (!isnan(termocoupleTemp) && termocoupleTemp > thresholdHigh) {
+    pilotoApagado = false;
+    digitalWrite(LED_PILOTO_ENCENDIDO, HIGH);
+    digitalWrite(LED_PILOTO_APAGADO, LOW);
+    messageSent = false;
+  } else {
+    pilotoApagado = true;
+    digitalWrite(LED_PILOTO_ENCENDIDO, LOW);
+    digitalWrite(LED_PILOTO_APAGADO, HIGH);
+    messageSent = true;
+  }
+  ultimoEstadoPiloto = pilotoApagado;
+
+  // --- Envío de mensaje de arranque (buffer, no String) ---
+  if (WiFi.status() == WL_CONNECTED) {
+    char startupMsg[160];
+    char ds18Msg[40];
+    char tcMsg[40];
+
+    if (dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp) || ds18b20Temp == DEVICE_DISCONNECTED_C) {
+      snprintf(ds18Msg, sizeof(ds18Msg), "DS18B20: ERROR");
+    } else {
+      snprintf(ds18Msg, sizeof(ds18Msg), "🌡️ Temp: %.1f C", ds18b20Temp);
+    }
+
+    if (thermoFaultCount >= FAULT_THRESHOLD || isnan(termocoupleTemp)) {
+      snprintf(tcMsg, sizeof(tcMsg), "Termocupla: ERROR");
+    } else {
+      snprintf(tcMsg, sizeof(tcMsg), "Termocupla: OK");
+    }
+
+    snprintf(startupMsg, sizeof(startupMsg), "%s\n%s\n%s",
+      pilotoApagado ? "Piloto: APAGADO" : "Piloto: ENCENDIDO",
+      ds18Msg,
+      tcMsg);
+
+    if (millis() - lastMsgSentMillis > MSG_MIN_INTERVAL_MS) {
+      sendTelegramMessage(startupMsg);
+      lastMsgSentMillis = millis();
+    } else {
+      Serial.println("Startup: mensaje retroadaptado por rate-limit");
+    }
+    delay(200);
+  } else {
+    Serial.println("No hay WiFi: no se envia mensaje de arranque, solo debug por serial");
+  }
+
+  // --- Aviso inicial por Telegram (buffer) ---
+  char estadoPiloto[32];
+  char estadoTemp[48];
+  char estadoRele[128];
+  char mensaje[192];
+
+  strcpy(estadoPiloto, pilotoApagado ? "⚠️ Piloto APAGADO" : "✅ Piloto ENCENDIDO");
+  if (dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp) || ds18b20Temp == DEVICE_DISCONNECTED_C) {
+    strcpy(estadoTemp, "🌡️ Temp DS18B20: ERROR");
+    strcpy(estadoRele, "Relé: ON (caldera encendida)\nModo: Manual (Automático OFF)\nSetpoint: No definido. Envíe /set XX.X para activar modo automático.");
+  } else {
+    snprintf(estadoTemp, sizeof(estadoTemp), "🌡️ Temp: %.1f °C", ds18b20Temp);
+    snprintf(estadoRele, sizeof(estadoRele),
+      "Relé: ON (caldera encendida)\nModo: Manual (Automático OFF)\nSetpoint: No definido. Envíe /set XX.X para activar modo automático.");
+  }
+  snprintf(mensaje, sizeof(mensaje), "📡 Inicio del sistema\n%s\n%s\n%s", estadoPiloto, estadoTemp, estadoRele);
+  sendTelegramMessage(mensaje);
+
+  // --- LANZAR TAREAS FREERTOS ---
+  xTaskCreate(
+    tareaDS18B20,      // función de la tarea
+    "TareaDS18B20",    // nombre
+    2048,              // stack size
+    NULL,              // parámetro
+    1,                 // prioridad
+    &handleDS18B20     // <-- GUARDA EL HANDLE PARA SUSPENDER/REANUDAR
+  );
+  xTaskCreate(
+    tareaMAX6675,      // función de la tarea
+    "TareaMAX6675",    // nombre
+    2048,              // stack size
+    NULL,              // parámetro
+    1,                 // prioridad
+    NULL               // handle
+  );
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // --- 0) Chequeo de WiFi y reconexión/notificación ---
+  checkWiFiAndNotify();
+
+  // --- DETECCIÓN DE TRANSICIÓN TERMOCUPLA (conectada ↔ desconectada) ---
+  bool termocuplaDesconectada = (thermoFaultCount >= FAULT_THRESHOLD);
+
+  // Detectar desconexión (solo una vez)
+  if (termocuplaDesconectada && !termocuplaDesconectadaAnterior && !mensajeErrorTermocuplaEnviado) {
+    sendTelegramMessage("⚠️ ERROR: Termocupla (MAX6675) no responde");
+    mensajeErrorTermocuplaEnviado = true;
+  }
+
+  // Detectar reconexión SOLO si la lectura es válida y el contador bajó de fallo
+  if (!termocuplaDesconectada && termocuplaDesconectadaAnterior && !isnan(termocoupleTemp)) {
+    sendTelegramMessage("✅ Termocupla conectada");
+    mensajeErrorTermocuplaEnviado = false;
+  }
+
+  // Actualizar estado anterior
+  termocuplaDesconectadaAnterior = termocuplaDesconectada;
+
+  // --- 2) Decidir estado del piloto (basado en última lectura filtrada) ---
+  bool pilotCurrentlyOn = false;
+  
+  if (!isnan(termocoupleTemp) && thermoFaultCount < FAULT_THRESHOLD) {
+    // Usar histéresis para evitar oscilaciones
+    if (termocoupleTemp > thresholdHigh) {
+      pilotCurrentlyOn = true;
+    } else if (termocoupleTemp < thresholdLow) {
+      pilotCurrentlyOn = false;
+    } else {
+      // En zona de histéresis: mantener estado anterior
+      pilotCurrentlyOn = !pilotoApagado;
+    }
+  } else {
+    pilotCurrentlyOn = false;
+  }
+
+  // --- actualizamos LEDs y flags si hubo cambio ---
+  static bool prevPilotoApagadoInitialized = false;
+  static bool prevPilotoApagado = false;
+  if (!prevPilotoApagadoInitialized) {
+    prevPilotoApagado = pilotoApagado;
+    prevPilotoApagadoInitialized = true;
+  }
+
+  if (pilotCurrentlyOn && pilotoApagado) {
+    pilotoApagado = false;
+    digitalWrite(LED_PILOTO_ENCENDIDO, HIGH);
+    digitalWrite(LED_PILOTO_APAGADO, LOW);
+    messageSent = false;
+    Serial.println("Evento: PILOTO ENCENDIDO (estado actualizado, sin envío)");
+  }
+  else if (!pilotCurrentlyOn && !pilotoApagado) {
+    pilotoApagado = true;
+    digitalWrite(LED_PILOTO_ENCENDIDO, LOW);
+    digitalWrite(LED_PILOTO_APAGADO, HIGH);
+    messageSent = true;
+    Serial.println("Evento: PILOTO APAGADO (estado actualizado, sin envío)");
+  }
+
+  // --- 🔄 Detección de cambio de estado del piloto (envía UNICA notificación con temp) ---
+  if (pilotoApagado != ultimoEstadoPiloto) {
+    if (now - lastMsgSentMillis > MSG_MIN_INTERVAL_MS) {
+      // Usar la lectura actualizada por la tarea FreeRTOS
+      char estadoPiloto[32];
+      char estadoTemp[48];
+      char mensaje[128];
+      strcpy(estadoPiloto, pilotoApagado ? "⚠️ Piloto APAGADO" : "✅ Piloto ENCENDIDO");
+      if (dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp) || ds18b20Temp == DEVICE_DISCONNECTED_C) {
+        strcpy(estadoTemp, "DS18B20: ERROR");
+      } else {
+        snprintf(estadoTemp, sizeof(estadoTemp), "🌡️ Temp: %.1f °C", ds18b20Temp);
+      }
+      snprintf(mensaje, sizeof(mensaje), "🔄 Cambio de estado detectado:\n%s\n%s", estadoPiloto, estadoTemp);
+      sendTelegramMessage(mensaje);
+
+      lastMsgSentMillis = now;
+      ultimoEstadoPiloto = pilotoApagado;
+    } else {
+      Serial.println("Cambio de estado detectado pero suprimido por rate-limit");
+    }
+  }
+  // si no hubo transición, no hacemos nada, dejamos flags como están
+
+  // --- 4) LED de WiFi (actualizar frecuentemente) ---
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_WIFI, HIGH);
+  } else {
+    digitalWrite(LED_WIFI, LOW);
+  }
+
+  // --- 5) Poll Telegram (cada 1s) ---
+  static unsigned long lastTelegramPollMillis = 0;
+  if (now - lastTelegramPollMillis >= 1000) {
+    lastTelegramPollMillis = now;
+    checkTelegramMessages();
+  }
+
+  // --- 6) Manejo de error DS18B20 con reinicialización segura ---
+  // reportar fallo DS18B20 (si alcanza umbral y rate-limit permite)
+  static bool mensajeErrorDS18B20Enviado = false;
+  static bool intentoReinicializacionDS18B20 = false;
+  
+  if (dsFaultCount >= FAULT_THRESHOLD && !mensajeErrorDS18B20Enviado) {
+    // Solo intenta reinicializar UNA VEZ por cada error
+    if (!intentoReinicializacionDS18B20) {
+      oneWire.reset();
+      sensors.begin();
+      delay(100);
+      sensors.requestTemperatures();
+      float dTest = sensors.getTempCByIndex(0);
+      Serial.print("Reintento DS18B20 tras error, lectura: ");
+      Serial.println(dTest);
+      intentoReinicializacionDS18B20 = true;
+    }
+    sendTelegramMessage("⚠️ ERROR: DS18B20 no responde, MODO MANUAL caldera encendida por seguridad");
+    mensajeErrorDS18B20Enviado = true;
+    lastMsgSentMillis = now;
+
+    // Fuerza modo MANUAL por seguridad
+    automatico = false;
+    setpointTemp = NAN;
+    releOn = true;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH); // Relé OFF, caldera encendida
+  }
+  
+  // reportar reconexión DS18B20
+  if (dsFaultCount < FAULT_THRESHOLD && mensajeErrorDS18B20Enviado) {
+    sendTelegramMessage("✅ DS18B20 reconectado");
+    mensajeErrorDS18B20Enviado = false;
+    intentoReinicializacionDS18B20 = false;  // Permitir reinicialización en próximo error
+    lastMsgSentMillis = now;
+    // NO actives automático aquí. El usuario debe enviar /set XX.X para reactivarlo.
+  }
+
+    // Manejo expiración override chimenea
+  if (chimneyOverrideActive && millis() > chimneyOverrideUntil) {
+    chimneyOverrideActive = false;
+    // Volver a comportamiento normal (restaurar control segun automatico/releOn)
+    controlarRele();
+
+    char msg[120];
+    snprintf(msg, sizeof(msg),
+      "✅ OVERRIDE CHIMENEA finalizado. Control normal reanudado (set chimenea %.1f°C).",
+      chimneySetpoint);
+    sendTelegramMessage(msg);
+    Serial.println(msg);
+  }
+
+  // --- 7) Pequeña pausa cooperativa ---
+  delay(10);
+}
+
+// --- FUNCION: Chequeo WiFi y notificación reconexión ---
+
+void checkWiFiAndNotify() {
+  unsigned long now = millis();
+  if (now - lastWiFiCheck > WIFI_CHECK_INTERVAL) {
+    lastWiFiCheck = now;
+    if (WiFi.status() != WL_CONNECTED) {
+      if (handleDS18B20 != NULL) vTaskSuspend(handleDS18B20);
+      if (!wifiWasConnected) {
+      // Ya estaba desconectado, cuenta tiempo
+        if (wifiLostSince == 0) wifiLostSince = now;
+        if ((now - wifiLostSince > WIFI_MANUAL_TIMEOUT) && !modoManualPorWiFi) {
+      // Timeout alcanzado, forzar modo manual
+          automatico = false;
+          releOn = true;
+          digitalWrite(RELAY_DRIVER_PIN, LOW); // Relé ON/caldera encendida
+          modoManualPorWiFi = true;
+          sendTelegramMessage("⚠️ WiFi perdido por más de 2 minutos. Pasando a Modo Manual. Caldera encendida por seguridad.");
+        }
+      } else {
+        wifiLostSince = now;
+        wifiWasConnected = false;
+      }
+      WiFi.reconnect();
+    } else {
+      if (!wifiWasConnected) {
+      // Se acaba de reconectar
+        sendTelegramMessage("✅ WiFi reconectado. Sistema online.");
+     // Reinicializar bus OneWire y DS18B20 tras reconexión WiFi
+       // PROTEGER reconexión DS18B20 en checkWiFiAndNotify (usar mutex)
+       if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(1000))) {
+          oneWire.reset();
+          sensors.begin();
+          delay(100);
+          sensors.requestTemperatures();
+          
+          // lectura inicial por address/idx
+          if (ambAddrValid) ds18b20Temp = sensors.getTempC(ambientAddr);
+          else ds18b20Temp = sensors.getTempCByIndex(0);
+          xSemaphoreGive(oneWireMutex);
+         } else {
+          Serial.println("Warning: no se pudo tomar mutex OneWire en reconexión WiFi");
+       }
+
+        
+        Serial.print("Reinicialización DS18B20 tras reconexión WiFi, lectura: ");
+        Serial.println(ds18b20Temp);
+        if (handleDS18B20 != NULL) vTaskResume(handleDS18B20);
+        
+        if (modoManualPorWiFi) {
+          sendTelegramMessage("⚠️ El sistema está en Modo Manual por corte de WiFi. Reajuste el modo si lo desea.");
+          modoManualPorWiFi = false;
+        }
+        wifiLostSince = 0;
+        wifiWasConnected = true;
+      }
+    }
+  }
+}
+
+// --- CONTROL AUTOMÁTICO DEL RELÉ CON HISTÉRESIS ---
+void controlarRele() {
+  // 1) Si hay fallo en el sensor ambiente o setpoint inválido -> FORZAR CALDERA ENCENDIDA (seguridad)
+  // Convención: digitalWrite(HIGH) => caldera ENCENDIDA (según wiring actual)
+  //             releOn == false -> caldera ENCENDIDA
+  //             releOn == true  -> caldera APAGADA
+
+  // si override chimenea activo -> forzar caldera ENCENDIDA y no permitir cambios
+  if (chimneyOverrideActive) {
+    // mantener caldera ENCENDIDA mientras override activo
+    releOn = false;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH);
+    return;
+  }
+  
+  if (dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp) || isnan(setpointTemp)) {
+    // Forzamos CALDERA ENCENDIDA por seguridad
+    releOn = false;                        // indicamos que la caldera está ENCENDIDA
+    digitalWrite(RELAY_DRIVER_PIN, HIGH);  // pin HIGH = caldera encendida
+    return;
+  }
+
+  // 2) Si estamos en modo MANUAL -> respetar el estado solicitado por el usuario (releOn)
+  if (!automatico) {
+    if (releOn) {
+      // Usuario quiere RELÉ "ON" lógico = APAGAR caldera según convención de mensajes (releOn true => OFF)
+      digitalWrite(RELAY_DRIVER_PIN, LOW);   // pin LOW => caldera APAGADA
+    } else {
+      digitalWrite(RELAY_DRIVER_PIN, HIGH);  // pin HIGH => caldera ENCENDIDA
+    }
+    return;
+  }
+
+  // 3) Modo AUTOMÁTICO: aplicar histéresis usando ds18b20Temp y setpointTemp
+  if (ds18b20Temp < setpointTemp - histeresis) {
+    // Temperatura por debajo: encender caldera
+    releOn = false;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH);
+  } else if (ds18b20Temp > setpointTemp + histeresis) {
+    // Temperatura por encima: apagar caldera
+    releOn = true;
+    digitalWrite(RELAY_DRIVER_PIN, LOW);
+  }
+  // Si está dentro de la banda de histéresis, mantener estado actual (no cambiar).
+}
+
+// ------------------ FUNCIÓN PARA LEER MENSAJES DE TELEGRAM ------------------
+void checkTelegramMessages() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + String(botToken) +
+               "/getUpdates?offset=" + String(lastUpdateId + 1) + "&limit=1";
+  http.begin(url);
+  int code = http.GET();
+
+  if (code > 0) {
+    String resp = http.getString();
+    Serial.println("Respuesta Telegram:");
+    Serial.println(resp);
+
+    const size_t capacity = 2048;
+    DynamicJsonDocument doc(capacity);
+    DeserializationError error = deserializeJson(doc, resp);
+
+    if (error) {
+      Serial.print("❌ Error al parsear JSON: ");
+      Serial.println(error.c_str());
+      http.end();
+      return;
+    }
+
+    JsonArray result = doc["result"];
+    if (result.size() == 0) {
+      http.end();
+      return;
+    }
+
+    JsonObject msgObj = result[0];
+    int32_t updId = msgObj["update_id"];
+    JsonObject message = msgObj["message"];
+    int64_t incomingChatId = message["chat"]["id"].as<int64_t>();
+    const char* msgText = message["text"];
+
+    if (!msgText) {
+      Serial.println("⚠️ Mensaje sin texto, ignorado.");
+      http.end();
+      return;
+    }
+
+    int64_t allowedChat = atoll(chatID);  // chatID debe estar definido como const char* = "8125582652";
+
+    if (incomingChatId != allowedChat) {
+      Serial.println("❌ Mensaje NO autorizado, ignorado.");
+      http.end();
+      return;
+    }
+
+    // ✅ Actualizar el update_id ANTES de procesar el mensaje
+    lastUpdateId = updId;
+    prefs.putInt("lastId", lastUpdateId);
+    Serial.print("✅ Actualizado lastUpdateId a: ");
+    Serial.println(lastUpdateId);
+
+    Serial.print("Comando recibido (chat ");
+    Serial.print(incomingChatId);
+    Serial.print("): ");
+    Serial.println(msgText);
+
+    String msg = String(msgText);
+    char respuesta[192];  // <-- solo una vez aquí
+
+    // ---------------- COMANDOS ----------------
+    if (msg == "/estado") {
+      char estadoPiloto[32];
+      char estadoTemp[48];
+      char estadoRele[128];
+
+      // Piloto: si termocupla falla, mostrar error
+      if (thermoFaultCount >= FAULT_THRESHOLD || isnan(termocoupleTemp)) {
+        strcpy(estadoPiloto, "⚠️ ERROR: Termocupla no responde");
+      } else {
+        strcpy(estadoPiloto, pilotoApagado ? "⚠️ Piloto APAGADO" : "✅ Piloto ENCENDIDO");
+      }
+
+      // DS18B20: solo un mensaje, no duplicar
+      if (dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+        strcpy(estadoTemp, "🌡️ ERROR: DS18B20 no responde");
+        strcpy(estadoRele, "Relé: ON (caldera encendida)\nModo: Manual (Automático OFF)\nSetpoint: No ajustable (error sensor ambiente)");
+      } else if (!automatico || isnan(setpointTemp)) {
+        snprintf(estadoTemp, sizeof(estadoTemp), "🌡️ Temp: %.1f °C", ds18b20Temp);
+        snprintf(estadoRele, sizeof(estadoRele), "Relé: ON (caldera encendida)\nModo: Manual (Automático OFF)\nSetpoint: No definido. Envíe /set XX.X para activar modo automático.");
+      } else {
+        snprintf(estadoTemp, sizeof(estadoTemp), "🌡️ Temp: %.1f °C", ds18b20Temp);
+        snprintf(estadoRele, sizeof(estadoRele),
+          "Relé: %s (caldera %s)\nModo: Automático\nSetpoint: %.1f °C",
+          releOn ? "OFF" : "ON",
+          releOn ? "apagada" : "encendida",
+          setpointTemp
+        );
+      }
+      snprintf(respuesta, sizeof(respuesta), "%s\n%s\n%s", estadoPiloto, estadoTemp, estadoRele);
+      sendTelegramMessage(respuesta);
+    } 
+    // ----- COMANDOS DE TERMOSTATO Y RELÉ -----
+    
+    else if (msg.startsWith("/set ")) {
+      float valor = msg.substring(5).toFloat();
+      // Si hay error en DS18B20, NO ajustar setpoint ni modo automático
+      if (dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+        snprintf(respuesta, sizeof(respuesta),
+          "❌ No es posible ajustar setpoint: error en sensor ambiente (DS18B20).\n🌡️ ERROR: DS18B20 no responde\nModo: Manual (Automático OFF)\nRelé: ON (caldera encendida)"
+        );
+        automatico = false;
+        setpointTemp = NAN;
+        releOn = true;
+        digitalWrite(RELAY_DRIVER_PIN, LOW);
+        sendTelegramMessage(respuesta);
+      } else if (valor >= 10.0 && valor <= 35.0) {
+        setpointTemp = valor;
+        automatico = true;
+        controlarRele();
+        snprintf(respuesta, sizeof(respuesta),
+          "✅ Setpoint actualizado a %.1f °C.\nModo: Automático.\nRelé: %s (caldera %s)",
+          setpointTemp,
+          releOn ? "OFF" : "ON",
+          releOn ? "apagada" : "encendida" 
+        );
+        sendTelegramMessage(respuesta);
+      } else {
+        sendTelegramMessage("❌ Valor fuera de rango (10-35°C)");
+      }
+    }
+
+        // SET CHIMENEA
+    else if (msg.startsWith("/chimset ")) {
+      float val = msg.substring(8).toFloat();
+      if (val >= 10.0 && val <= 200.0) { // rango razonable
+        chimneySetpoint = val;
+        char buf[80];
+        snprintf(buf, sizeof(buf), "✅ Setpoint CHIMENEA actualizado a %.1f °C", chimneySetpoint);
+        sendTelegramMessage(buf);
+      } else {
+        sendTelegramMessage("❌ Valor fuera de rango para /chimset (10-200°C)");
+      }
+    }
+
+        else if (msg == "/chimstatus") {
+      char buf[160];
+      if (chimneyIndex < 0) {
+        sendTelegramMessage("🔍 Sensor chimenea NO detectado.");
+      } else {
+        snprintf(buf, sizeof(buf), "🌡️ Chimenea: %.1f °C\nSetpoint: %.1f °C\nOverride: %s",
+          isnan(chimneyTemp) ? NAN : chimneyTemp,
+          chimneySetpoint,
+          chimneyOverrideActive ? "ACTIVO" : "INACTIVO");
+        sendTelegramMessage(buf);
+      }
+    }
+      
+    // RELE OFF
+     else if (msg == "/rele_off") {
+  // Si override chimenea activo, ignorar comando y avisar
+  if (chimneyOverrideActive) {
+    unsigned long remSec = 0;
+    if (chimneyOverrideUntil > millis()) remSec = (chimneyOverrideUntil - millis()) / 1000;
+    char buf[120];
+    snprintf(buf, sizeof(buf), "⚠️ OVERRIDE CHIMENEA ACTIVO. Comando ignorado. Restan %lu s.", remSec);
+    sendTelegramMessage(buf);
+  } else {
+    // Usuario solicita RELÉ "OFF" lógico -> queremos CALDERA APAGADA
+    releOn = true;
+    automatico = false;
+    digitalWrite(RELAY_DRIVER_PIN, LOW); // pin LOW => caldera APAGADA (según convención)
+    controlarRele(); // mantener consistencia
+    sendTelegramMessage("⚪ Relé FORZADO a OFF (caldera apagada, modo manual)");
+  }
+}
+    // RELE on
+    else if (msg == "/rele_on") {
+  if (chimneyOverrideActive) {
+    unsigned long remSec = 0;
+    if (chimneyOverrideUntil > millis()) remSec = (chimneyOverrideUntil - millis()) / 1000;
+    char buf[120];
+    snprintf(buf, sizeof(buf), "⚠️ OVERRIDE CHIMENEA ACTIVO. Comando ignorado. Restan %lu s.", remSec);
+    sendTelegramMessage(buf);
+  } else {
+    releOn = false;
+    automatico = false;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH); // pin HIGH => caldera ENCENDIDA
+    controlarRele();
+    sendTelegramMessage("⚫ Relé FORZADO a ON (caldera encendida, modo manual)");
+  }
+}
+    
+    else if (msg == "/termocupla") {
+      if (thermoFaultCount >= FAULT_THRESHOLD) {
+        sendTelegramMessage("⚠️ ERROR: Termocupla no responde");
+      } else {
+        snprintf(respuesta, sizeof(respuesta), "🔥 Termocupla (MAX6675): %.1f °C", termocoupleTemp);
+        sendTelegramMessage(respuesta);
+      }
+    } 
+    else if (msg == "/reiniciar") {
+      snprintf(respuesta, sizeof(respuesta), "♻️ Reiniciando ESP32...\n");
+      char pilotoMsg[48];
+      char tempMsg[48];
+      char releMsg[64];
+      // Piloto: error si termocupla falla
+      if (thermoFaultCount >= FAULT_THRESHOLD || isnan(termocoupleTemp)) {
+        snprintf(pilotoMsg, sizeof(pilotoMsg), "⚠️ ERROR: Termocupla no responde");
+      }  else {
+        snprintf(pilotoMsg, sizeof(pilotoMsg), pilotoApagado ? "⚠️ Piloto APAGADO" : "✅ Piloto ENCENDIDO");
+      }
+      // Temp: error si DS18B20 falla
+      if (dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+        snprintf(tempMsg, sizeof(tempMsg), "🌡️ ERROR: DS18B20 no responde");
+        snprintf(releMsg, sizeof(releMsg), "Setpoint: No ajustable\nRelé: ON (caldera encendida)\nModo: Manual (Automático OFF)");
+      } else {
+        snprintf(tempMsg, sizeof(tempMsg), "🌡️ Última temp: %.1f °C", ds18b20Temp);
+        snprintf(releMsg, sizeof(releMsg), "Setpoint: %.1f °C\nRelé: %s\nModo: %s",
+          setpointTemp,
+          releOn ? "ON (caldera apagada)" : "OFF (caldera encendida)",
+          !automatico ? "MANUAL" : "AUTOMÁTICO"
+        );
+      }
+      strncat(respuesta, pilotoMsg, sizeof(respuesta) - strlen(respuesta) - 1);
+      strncat(respuesta, "\n", sizeof(respuesta) - strlen(respuesta) - 1);
+      strncat(respuesta, tempMsg, sizeof(respuesta) - strlen(respuesta) - 1);
+      strncat(respuesta, "\n", sizeof(respuesta) - strlen(respuesta) - 1);
+      strncat(respuesta, releMsg, sizeof(respuesta) - strlen(respuesta) - 1);
+      sendTelegramMessage(respuesta);
+      delay(1000);
+      ESP.restart();
+    }
+    else {
+      sendTelegramMessage("Comando no reconocido.\nUsa /estado, /set XX.X, /chimstatus, /chimset, /rele_off, /rele_on, /termocupla o /reiniciar.");
+    }
+  } else {
+    Serial.print("Error al consultar Telegram, code: ");
+    Serial.println(code);
+  }
+  http.end();
+}
