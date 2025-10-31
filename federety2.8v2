@@ -285,7 +285,7 @@ void tareaDS18B20(void * parameter) {
         releOn = false;
         digitalWrite(RELAY_DRIVER_PIN, HIGH);
 
-        char msg[160];
+        static char msg[160]; // static → no se aloja en la pila de la tarea
         unsigned long min = chimneyOverrideDurationMs / 60000UL;
         snprintf(msg, sizeof(msg),
           "🔥 OVERRIDE CHIMENEA activado: temp salida %.1f°C < set %.1f°C. Caldera ENCENDIDA por %lu min.",
@@ -521,7 +521,7 @@ if (savedChim.length() == 16 && hexToAddress(savedChim, chimAddr)) {
   xTaskCreate(
     tareaDS18B20,      // función de la tarea
     "TareaDS18B20",    // nombre
-    2048,              // stack size
+     8192,              // stack size (aumentado para evitar stack overflow)
     NULL,              // parámetro
     1,                 // prioridad
     &handleDS18B20     // <-- GUARDA EL HANDLE PARA SUSPENDER/REANUDAR
@@ -1035,7 +1035,7 @@ void checkTelegramMessages() {
       ESP.restart();
     }
     else {
-      sendTelegramMessage("Comando no reconocido.\nUsa /estado, /set XX.X, /chimstatus, /chimset, /rele_off, /rele_on, /termocupla o /reiniciar.");
+      sendTelegramMessage("Comando no reconocido.\nUsa /estado, /set XX.X, /chimstatus, /chimset XX.X, /rele_off, /rele_on, /termocupla o /reiniciar.");
     }
   } else {
     Serial.print("Error al consultar Telegram, code: ");
