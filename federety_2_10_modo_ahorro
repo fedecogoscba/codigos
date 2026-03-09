@@ -506,7 +506,6 @@ void loop() {
   
   // ✅ SOLO activar AHORRO si NO está en modo MANUAL
   if (!ds18b20Detectado || (dsFaultCount >= FAULT_THRESHOLD && !mensajeErrorDS18B20Enviado && !automatico)) {
-  //if (!ds18b20Detectado || (dsFaultCount >= FAULT_THRESHOLD && !mensajeErrorDS18B20Enviado)) {
     if (!intentoReinicializacionDS18B20) {
       if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
         oneWire.reset();
@@ -518,45 +517,44 @@ void loop() {
       }
       intentoReinicializacionDS18B20 = true;
     }
-    // MODIFICADO: Mensaje ahora dice MODO AHORRO
-    sendTelegramMessage("⚠️ ERROR: DS18B20 no responde, MODO AHORRO.");
-    mensajeErrorDS18B20Enviado = true;
-    lastMsgSentMillis = now;
+    // Enviar mensaje SOLO UNA VEZ
+    if (!mensajeErrorDS18B20Enviado) {
+      sendTelegramMessage("⚠️ ERROR: DS18B20 no responde, MODO AHORRO.");
+      mensajeErrorDS18B20Enviado = true;
+      lastMsgSentMillis = now;
 
-    // Activar modo AHORRO en lugar de MANUAL
-    modoAhorro = true;
-    ahorroEncendido = true;
-    ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;
-    ahorroApagadoHasta = 0;
-    automatico = false;
-    setpointTemp = NAN;
-    releOn = false;
-    digitalWrite(RELAY_DRIVER_PIN, HIGH);
+      // Activar modo AHORRO solo si no está en manual reciente
+      if ((now - ultimoComandoManual) > PROTECCION_MANUAL_MS) {
+        modoAhorro = true;
+        ahorroEncendido = true;
+        ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;
+        ahorroApagadoHasta = 0;
+        automatico = false;
+        setpointTemp = NAN;
+        releOn = false;
+        digitalWrite(RELAY_DRIVER_PIN, HIGH);
+      }
+    }
   }
 
   // ✅ RECUPERACIÓN: Solo si el sensor tiene lectura válida
   if (dsFaultCount < FAULT_THRESHOLD && mensajeErrorDS18B20Enviado) {
-  sendTelegramMessage("✅ DS18B20 reconectado");
-  mensajeErrorDS18B20Enviado = false;
-  intentoReinicializacionDS18B20 = false;
-  dsFaultCount = 0;  // ← RESET DEL CONTADOR
-  modoAhorro = false;
+    sendTelegramMessage("✅ DS18B20 reconectado");
+    mensajeErrorDS18B20Enviado = false;
+    intentoReinicializacionDS18B20 = false;
+    dsFaultCount = 0;
+    modoAhorro = false;
 
-  // ✅ RE-DETECTAR SENSOR
-  if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
-    ds18b20Count = sensors.getDeviceCount();
-    if (ds18b20Count > 0) {
-      ds18b20Detectado = true;
-      Serial.println("✓ DS18B20 detectado nuevamente");
-    } else {
-      ds18b20Detectado = false;
-      Serial.println("⚠️ DS18B20 aún desconectado");
+    // Re-detectar sensor
+    if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
+      ds18b20Count = sensors.getDeviceCount();
+      if (ds18b20Count > 0) {
+        ds18b20Detectado = true;
+      }
+      xSemaphoreGive(oneWireMutex);
     }
-    xSemaphoreGive(oneWireMutex);
+    lastMsgSentMillis = now;
   }
-   
-  lastMsgSentMillis = now;
-}
 
 
   // NUEVO: LÓGICA DE CONTROL MODO AHORRO
