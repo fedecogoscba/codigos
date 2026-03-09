@@ -494,66 +494,33 @@ void loop() {
     digitalWrite(LED_WIFI, LOW);
   }
 
+   static bool mensajeErrorDS18B20Enviado = false;
+
+   // ✅ DETECCIÓN RÁPIDA DE ERROR - Sin esperar al dsFaultCount
+  if (isnan(ds18b20Temp) && !mensajeErrorDS18B20Enviado) {
+    sendTelegramMessage("⚠️ ERROR: DS18B20 no responde, MODO AHORRO.");
+    mensajeErrorDS18B20Enviado = true;
+    modoAhorro = true;
+    ahorroEncendido = true;
+    ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;
+    automatico = false;
+    setpointTemp = NAN;
+    releOn = false;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH);
+  }
+
+  // ✅ RECUPERACIÓN
+  if (!isnan(ds18b20Temp) && mensajeErrorDS18B20Enviado) {
+    sendTelegramMessage("✅ DS18B20 reconectado");
+    mensajeErrorDS18B20Enviado = false;
+    dsFaultCount = 0;
+    modoAhorro = false;
+  }
+
   static unsigned long lastTelegramPollMillis = 0;
   if (now - lastTelegramPollMillis >= 1000) {
     lastTelegramPollMillis = now;
     checkTelegramMessages();
-  }
-
-  // --- MODIFICADO: Manejo error DS18B20 - activa MODO AHORRO ---
-  static bool mensajeErrorDS18B20Enviado = false;
-  static bool intentoReinicializacionDS18B20 = false;
-  
-  // ✅ SOLO activar AHORRO si NO está en modo MANUAL
-  if (!ds18b20Detectado || (dsFaultCount >= FAULT_THRESHOLD && !mensajeErrorDS18B20Enviado && !automatico)) {
-    if (!intentoReinicializacionDS18B20) {
-      if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
-        oneWire.reset();
-        sensors.begin();
-        delay(100);
-        sensors.requestTemperatures();
-        delay(1000);
-        xSemaphoreGive(oneWireMutex);
-      }
-      intentoReinicializacionDS18B20 = true;
-    }
-    // Enviar mensaje SOLO UNA VEZ
-    if (!mensajeErrorDS18B20Enviado) {
-      sendTelegramMessage("⚠️ ERROR: DS18B20 no responde, MODO AHORRO.");
-      mensajeErrorDS18B20Enviado = true;
-      lastMsgSentMillis = now;
-
-      // Activar modo AHORRO solo si no está en manual reciente
-      if ((now - ultimoComandoManual) > PROTECCION_MANUAL_MS) {
-        modoAhorro = true;
-        ahorroEncendido = true;
-        ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;
-        ahorroApagadoHasta = 0;
-        automatico = false;
-        setpointTemp = NAN;
-        releOn = false;
-        digitalWrite(RELAY_DRIVER_PIN, HIGH);
-      }
-    }
-  }
-
-  // ✅ RECUPERACIÓN: Solo si el sensor tiene lectura válida
-  if (dsFaultCount < FAULT_THRESHOLD && mensajeErrorDS18B20Enviado) {
-    sendTelegramMessage("✅ DS18B20 reconectado");
-    mensajeErrorDS18B20Enviado = false;
-    intentoReinicializacionDS18B20 = false;
-    dsFaultCount = 0;
-    modoAhorro = false;
-
-    // Re-detectar sensor
-    if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
-      ds18b20Count = sensors.getDeviceCount();
-      if (ds18b20Count > 0) {
-        ds18b20Detectado = true;
-      }
-      xSemaphoreGive(oneWireMutex);
-    }
-    lastMsgSentMillis = now;
   }
 
 
@@ -595,9 +562,9 @@ void loop() {
 
   // ✅ CONTROL DEL RELÉ - PROTEGIDO DE SOBRESCRITURAS MANUALES
   // Solo controlar si NO hay un comando manual reciente Y NO está en AHORRO
-  if ((now - ultimoComandoManual) > PROTECCION_MANUAL_MS && !modoAhorro) {
+  // if ((now - ultimoComandoManual) > PROTECCION_MANUAL_MS && !modoAhorro) {
     controlarReleAutomatico();
-  }
+  // }
 
   delay(10);
 }
@@ -655,7 +622,20 @@ void checkWiFiAndNotify() {
 
 // ✅ CONTROL AUTOMÁTICO - NO INTERFIERE CON MANUALES
 void controlarReleAutomatico() {
+   unsigned long now = millis();
+
+// ✅ PROTECCIÓN: Si hay comando manual reciente, NO hagas nada
+  if ((now - ultimoComandoManual) < 10000) {
+    return;  // ← Sal de la función, no toques el relé
+  }
+  
   // Si hay error DS18B20, forzar ON
+  if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+    releOn = false;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH);
+    return;
+  }
+   
   if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
     releOn = false;
     digitalWrite(RELAY_DRIVER_PIN, HIGH);
@@ -807,26 +787,24 @@ void checkTelegramMessages() {
 
     // ✅ COMANDO /rele_off - SIEMPRE ACTIVO
     else if (msg == "/rele_off") {
-      ultimoComandoManual = millis();
-      modoAhorro = false;  // Salir de AHORRO
+      ultimoComandoManual = millis() + 10000;  // ← 10 segundos
+      modoAhorro = false;
       automatico = false;
       setpointTemp = NAN;
       releOn = true;
       digitalWrite(RELAY_DRIVER_PIN, LOW);
-      
       Serial.println("✓ /rele_off ejecutado");
       sendTelegramMessage("⚪ Relé OFF - Caldera apagada (Manual)");
     }
     
     // ✅ COMANDO /rele_on - SIEMPRE ACTIVO
     else if (msg == "/rele_on") {
-      ultimoComandoManual = millis();
-      modoAhorro = false;  // Salir de AHORRO
+      ultimoComandoManual = millis() + 10000;  // ← 10 segundos
+      modoAhorro = false;
       automatico = false;
       setpointTemp = NAN;
       releOn = false;
       digitalWrite(RELAY_DRIVER_PIN, HIGH);
-      
       Serial.println("✓ /rele_on ejecutado");
       sendTelegramMessage("⚫ Relé ON - Caldera encendida (Manual)");
     }
