@@ -592,6 +592,7 @@ void loop() {
     }
   }
 
+
   // ✅ CONTROL DEL RELÉ - PROTEGIDO DE SOBRESCRITURAS MANUALES
   // Solo controlar si NO hay un comando manual reciente Y NO está en AHORRO
   if ((now - ultimoComandoManual) > PROTECCION_MANUAL_MS && !modoAhorro) {
