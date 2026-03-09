@@ -1,0 +1,885 @@
+// ============================================================
+// SISTEMA CONTROL CALDERA ESP32 - CON MODO AHORRO
+// - Sensor chimenea ANULADO
+// - Compatible con CUALQUIER DS18B20
+// - Modo AHORRO: 5 min ON / 2h OFF
+// - Comandos manuales SIEMPRE activos
+// ============================================================
+
+// --- LIBRERÍAS ---
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <max6675.h>
+#include <Preferences.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// --- PINES / HARDWARE ---
+#define LED_PILOTO_APAGADO 22
+#define LED_PILOTO_ENCENDIDO 21
+#define LED_WIFI 19
+#define ONE_WIRE_BUS 18
+
+const int thermoDO = 5;
+const int thermoCS = 4;
+const int thermoCLK = 2;
+
+// --- CREDENCIALES ---
+#include "config_private.h"
+
+// --- PERSISTENCIA ---
+Preferences prefs;
+int32_t lastUpdateId = 0;
+
+// --- OBJETOS SENSORES ---
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// --- VARIABLES COMPARTIDAS ---
+float ds18b20Temp = NAN;
+float ds18b20Offset = 0.0;
+int dsFaultCount = 0;
+
+float termocoupleTemp = NAN;
+int thermoFaultCount = 0;
+
+float thresholdLow = 60.0;
+float thresholdHigh = 61.0;
+TaskHandle_t handleDS18B20 = NULL;
+
+SemaphoreHandle_t oneWireMutex = NULL;
+
+bool ds18b20Detectado = false;
+int ds18b20Count = 0;
+
+// --- ESTADOS / FLAGS ---
+bool pilotoApagado = false;
+bool messageSent = false;
+bool ultimoEstadoPiloto;
+
+unsigned long lastMsgSentMillis = 0;
+const unsigned long MSG_MIN_INTERVAL_MS = 30UL * 1000UL;
+
+const int RELAY_DRIVER_PIN = 23;
+
+bool termocuplaDesconectadaAnterior = false;
+bool mensajeErrorTermocuplaEnviado = false;
+
+// --- WiFi ---
+unsigned long lastWiFiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 10000;
+bool wifiWasConnected = false;
+const unsigned long WIFI_MANUAL_TIMEOUT = 120000;
+unsigned long wifiLostSince = 0;
+bool modoManualPorWiFi = false;
+
+// --- CONTROL TERMOSTATO ---
+float setpointTemp = NAN;
+float histeresis = 0.5;
+bool releOn = true;
+bool automatico = false;
+
+const int FAULT_THRESHOLD = 5;
+
+// --- TIMESTAMP ÚLTIMO COMANDO MANUAL ---
+unsigned long ultimoComandoManual = 0;
+const unsigned long PROTECCION_MANUAL_MS = 5000;
+
+// ============================================================
+// NUEVO: MODO AHORRO DE ENERGÍA
+// ============================================================
+bool modoAhorro = false;                    // true = en modo AHORRO
+unsigned long ahorroEncendidoHasta = 0;     // millis() hasta cuando caldera ON en AHORRO
+unsigned long ahorroApagadoHasta = 0;       // millis() hasta cuando caldera OFF en AHORRO
+bool ahorroEncendido = true;                // true = fase ON (5 min), false = fase OFF (2h)
+
+const unsigned long AHORRO_ENCENDIDO_MS = 5UL * 60UL * 1000UL;         // 5 minutos encendida
+const unsigned long AHORRO_APAGADO_MS = 2UL * 60UL * 60UL * 1000UL;    // 2 horas apagada
+
+// --- Declaraciones anticipadas ---
+void checkWiFiAndNotify();
+void checkTelegramMessages();
+void controlarReleAutomatico();
+
+// --- FILTRO TERMOCUPLA ---
+float filtroTermocupla(int muestras = 5) {
+  float lecturas[5];
+  int validas = 0;
+  
+  for (int i = 0; i < muestras; ++i) {
+    delay(250);
+    float t = thermocouple.readCelsius();
+    if (!isnan(t) && t >= -5.0 && t <= 600.0) {
+      lecturas[validas++] = t;
+    }
+  }
+  
+  if (validas < 3) return NAN;
+  
+  for (int i = 0; i < validas - 1; i++) {
+    for (int j = i + 1; j < validas; j++) {
+      if (lecturas[i] > lecturas[j]) {
+        float temp = lecturas[i];
+        lecturas[i] = lecturas[j];
+        lecturas[j] = temp;
+      }
+    }
+  }
+  return lecturas[validas / 2];
+}
+
+// --- URL-ENCODE ---
+String urlEncode(const String &str) {
+  const char hex[] = "0123456789ABCDEF";
+  String encoded = "";
+  for (size_t i = 0; i < str.length(); ++i) {
+    uint8_t c = (uint8_t)str[i];
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += (char)c;
+    } else {
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
+  }
+  return encoded;
+}
+
+// --- ENVIAR TELEGRAM ---
+void sendTelegramMessage(const char* text) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No hay WiFi, no se pudo enviar mensaje");
+    return;
+  }
+  String encodedText = urlEncode(text);
+  String url = String("https://api.telegram.org/bot") + String(botToken)
+               + "/sendMessage?chat_id=" + String(chatID)
+               + "&text=" + encodedText;
+
+  int maxRetries = 2;
+  int httpResponseCode = 0;
+  HTTPClient http;
+  for (int attempt = 0; attempt < maxRetries; ++attempt) {
+    http.begin(url);
+    httpResponseCode = http.GET();
+    http.end();
+    if (httpResponseCode > 0) break;
+    delay(500);
+  }
+
+  if (httpResponseCode > 0) {
+    Serial.print("✓ Mensaje Telegram OK: ");
+    Serial.println(httpResponseCode);
+  } else {
+    Serial.print("✗ Error Telegram: ");
+    Serial.println(httpResponseCode);
+  }
+}
+
+// --- TAREA DS18B20 ---
+void tareaDS18B20(void * parameter) {
+  for(;;) {
+    if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
+      
+      sensors.requestTemperatures();
+      delay(1000);
+      
+      if (ds18b20Detectado) {
+        float d = sensors.getTempCByIndex(0);
+        
+        if (d == DEVICE_DISCONNECTED_C || isnan(d)) {
+          dsFaultCount++;
+          ds18b20Temp = NAN;
+          Serial.println("⚠️ DS18B20: Lectura INVÁLIDA");
+        } else {
+          dsFaultCount = 0;
+          ds18b20Temp = d + ds18b20Offset;
+          Serial.print("✓ DS18B20: ");
+          Serial.print(ds18b20Temp, 1);
+          Serial.println(" °C");
+        }
+      } else {
+        dsFaultCount++;
+        ds18b20Temp = NAN;
+      }
+      
+      xSemaphoreGive(oneWireMutex);
+    }
+
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+  }
+}
+
+// --- TAREA MAX6675 ---
+void tareaMAX6675(void * parameter) {
+  for(;;) {
+    float t = filtroTermocupla(5);
+    if (!isnan(t)) {
+      thermoFaultCount = 0;
+      termocoupleTemp = t;
+      Serial.print("✓ MAX6675: ");
+      Serial.print(termocoupleTemp, 1);
+      Serial.println(" °C");
+    } else {
+      thermoFaultCount++;
+      termocoupleTemp = NAN;
+      Serial.println("⚠️ MAX6675: Error");
+    }
+    vTaskDelay(2500 / portTICK_PERIOD_MS);
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  oneWireMutex = xSemaphoreCreateMutex();
+  if (oneWireMutex == NULL) {
+    Serial.println("✗ Error: no se pudo crear mutex");
+  }
+
+  // LEDs
+  pinMode(LED_PILOTO_APAGADO, OUTPUT);        
+  digitalWrite(LED_PILOTO_APAGADO, LOW);
+  pinMode(LED_PILOTO_ENCENDIDO, OUTPUT);
+  digitalWrite(LED_PILOTO_ENCENDIDO, LOW);
+  pinMode(LED_WIFI, OUTPUT);
+  digitalWrite(LED_WIFI, LOW);
+
+  // Relé - ESTADO INICIAL: ENCENDIDO (caldera ON)
+  pinMode(RELAY_DRIVER_PIN, OUTPUT);
+  digitalWrite(RELAY_DRIVER_PIN, HIGH);  // HIGH = caldera ENCENDIDA
+  releOn = false;
+  automatico = false;
+  setpointTemp = NAN;
+
+  // NUEVO: Inicializar modo AHORRO al arranque
+  modoAhorro = true;
+  ahorroEncendido = true;
+  ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;
+  ahorroApagadoHasta = 0;
+
+  // NVS
+  prefs.begin("tg", false);
+  lastUpdateId = prefs.getInt("lastId", 0);
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando WiFi...");
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+    delay(250);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi OK");
+    digitalWrite(LED_WIFI, HIGH);
+    wifiWasConnected = true;
+  } else {
+    Serial.println("\n⚠️ WiFi error");
+    digitalWrite(LED_WIFI, LOW);
+    wifiWasConnected = false;
+  }
+  
+// Sensores
+sensors.begin();
+delay(50);
+
+// Detección DS18B20
+if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(1000))) {
+  ds18b20Count = sensors.getDeviceCount();
+  
+  Serial.print("📋 DS18B20 encontrados: ");
+  Serial.println(ds18b20Count);
+  
+  if (ds18b20Count > 0) {
+    ds18b20Detectado = true;
+    Serial.println("✓ Usando sensor índice 0");
+  } else {
+    ds18b20Detectado = false;
+    Serial.println("✗ Ningún DS18B20 detectado");
+  }
+  
+  // ✅ PRIMERA LECTURA (descartar - siempre inválida)
+  delay(1000);
+  sensors.requestTemperatures();
+  delay(1000);
+  delay(1000);
+  float tempDescartada = sensors.getTempCByIndex(0);
+  Serial.print("⚠️ Primera lectura descartada: ");
+  Serial.println(tempDescartada);
+  
+  // ✅ SEGUNDA LECTURA (válida)
+  delay(500);
+  sensors.requestTemperatures();
+  delay(1000);
+  ds18b20Temp = sensors.getTempCByIndex(0);
+  
+  if (ds18b20Detectado) {
+    if (isnan(ds18b20Temp) || ds18b20Temp == DEVICE_DISCONNECTED_C || ds18b20Temp == 85.0) {
+      dsFaultCount++;
+      ds18b20Temp = NAN;
+      Serial.println("⚠️ DS18B20: Error en lectura inicial");
+    } else {
+      dsFaultCount = 0;
+      Serial.print("✓ DS18B20 inicial (válida): ");
+      Serial.print(ds18b20Temp, 1);
+      Serial.println(" °C");
+    }
+  }
+  
+  xSemaphoreGive(oneWireMutex);
+}
+
+  // Termocupla
+  termocoupleTemp = thermocouple.readCelsius();
+  if (isnan(termocoupleTemp)) {
+    thermoFaultCount++;
+    Serial.println("⚠️ MAX6675: Error inicial");
+    sendTelegramMessage("⚠️ ERROR: Termocupla no responde");
+    termocuplaDesconectadaAnterior = true;
+    mensajeErrorTermocuplaEnviado = true;
+  } else {
+    thermoFaultCount = 0;
+    Serial.print("✓ MAX6675 inicial: ");
+    Serial.print(termocoupleTemp, 1);
+    Serial.println(" °C");
+    termocuplaDesconectadaAnterior = false;
+    mensajeErrorTermocuplaEnviado = false;
+  }
+
+  // Estado piloto
+  if (!isnan(termocoupleTemp) && termocoupleTemp > thresholdHigh) {
+    pilotoApagado = false;
+    digitalWrite(LED_PILOTO_ENCENDIDO, HIGH);
+    digitalWrite(LED_PILOTO_APAGADO, LOW);
+  } else {
+    pilotoApagado = true;
+    digitalWrite(LED_PILOTO_ENCENDIDO, LOW);
+    digitalWrite(LED_PILOTO_APAGADO, HIGH);
+  }
+  ultimoEstadoPiloto = pilotoApagado;
+
+  // Mensaje inicio
+  if (WiFi.status() == WL_CONNECTED) {
+    char startupMsg[160];
+    char ds18Msg[40];
+    char tcMsg[40];
+
+    if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+      snprintf(ds18Msg, sizeof(ds18Msg), "🌡️ DS18B20: ERROR");
+    } else {
+      snprintf(ds18Msg, sizeof(ds18Msg), "🌡️ Temp: %.1f °C", ds18b20Temp);
+    }
+
+    if (thermoFaultCount >= FAULT_THRESHOLD || isnan(termocoupleTemp)) {
+      snprintf(tcMsg, sizeof(tcMsg), "🔥 Termocupla: ERROR");
+    } else {
+      snprintf(tcMsg, sizeof(tcMsg), "🔥 Termocupla: OK");
+    }
+
+    snprintf(startupMsg, sizeof(startupMsg), "%s\n%s\n%s",
+      pilotoApagado ? "⚠️ Piloto: APAGADO" : "✅ Piloto: ENCENDIDO",
+      ds18Msg, tcMsg);
+
+    if (millis() - lastMsgSentMillis > MSG_MIN_INTERVAL_MS) {
+      sendTelegramMessage(startupMsg);
+      lastMsgSentMillis = millis();
+    }
+    delay(200);
+  }
+
+  // MODIFICADO: Aviso inicial con MODO AHORRO
+  char estadoPiloto[32];
+  char estadoTemp[48];
+  char estadoRele[128];
+  char mensaje[192];
+
+  strcpy(estadoPiloto, pilotoApagado ? "⚠️ Piloto APAGADO" : "✅ Piloto ENCENDIDO");
+  if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+    strcpy(estadoTemp, "🌡️ DS18B20: ERROR");
+    strcpy(estadoRele, "Relé: ON (caldera encendida)\nModo: AHORRO\nSetpoint: No definido. Envíe /set XX.X");
+  } else {
+    snprintf(estadoTemp, sizeof(estadoTemp), "🌡️ Temp: %.1f °C", ds18b20Temp);
+    snprintf(estadoRele, sizeof(estadoRele),
+      "Relé: ON (caldera encendida)\nModo: AHORRO\nSetpoint: No definido. Envíe /set XX.X");
+  }
+  snprintf(mensaje, sizeof(mensaje), "📡 Inicio del sistema\n%s\n%s\n%s", estadoPiloto, estadoTemp, estadoRele);
+  sendTelegramMessage(mensaje);
+
+  // Tareas
+  xTaskCreate(tareaDS18B20, "TareaDS18B20", 8192, NULL, 1, &handleDS18B20);
+  xTaskCreate(tareaMAX6675, "TareaMAX6675", 2048, NULL, 1, NULL);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  checkWiFiAndNotify();
+
+  bool termocuplaDesconectada = (thermoFaultCount >= FAULT_THRESHOLD);
+
+  if (termocuplaDesconectada && !termocuplaDesconectadaAnterior && !mensajeErrorTermocuplaEnviado) {
+    sendTelegramMessage("⚠️ ERROR: Termocupla no responde");
+    mensajeErrorTermocuplaEnviado = true;
+  }
+
+  if (!termocuplaDesconectada && termocuplaDesconectadaAnterior && !isnan(termocoupleTemp)) {
+    sendTelegramMessage("✅ Termocupla conectada");
+    mensajeErrorTermocuplaEnviado = false;
+  }
+
+  termocuplaDesconectadaAnterior = termocuplaDesconectada;
+
+  bool pilotCurrentlyOn = false;
+  
+  if (!isnan(termocoupleTemp) && thermoFaultCount < FAULT_THRESHOLD) {
+    if (termocoupleTemp > thresholdHigh) {
+      pilotCurrentlyOn = true;
+    } else if (termocoupleTemp < thresholdLow) {
+      pilotCurrentlyOn = false;
+    } else {
+      pilotCurrentlyOn = !pilotoApagado;
+    }
+  } else {
+    pilotCurrentlyOn = false;
+  }
+
+  static bool prevPilotoApagadoInitialized = false;
+  static bool prevPilotoApagado = false;
+  if (!prevPilotoApagadoInitialized) {
+    prevPilotoApagado = pilotoApagado;
+    prevPilotoApagadoInitialized = true;
+  }
+
+  if (pilotCurrentlyOn && pilotoApagado) {
+    pilotoApagado = false;
+    digitalWrite(LED_PILOTO_ENCENDIDO, HIGH);
+    digitalWrite(LED_PILOTO_APAGADO, LOW);
+    Serial.println("Evento: PILOTO ENCENDIDO");
+  }
+  else if (!pilotCurrentlyOn && !pilotoApagado) {
+    pilotoApagado = true;
+    digitalWrite(LED_PILOTO_ENCENDIDO, LOW);
+    digitalWrite(LED_PILOTO_APAGADO, HIGH);
+    Serial.println("Evento: PILOTO APAGADO");
+  }
+
+  if (pilotoApagado != ultimoEstadoPiloto) {
+    if (now - lastMsgSentMillis > MSG_MIN_INTERVAL_MS) {
+      char estadoPiloto[32];
+      char estadoTemp[48];
+      char msgText[128];
+      strcpy(estadoPiloto, pilotoApagado ? "⚠️ Piloto APAGADO" : "✅ Piloto ENCENDIDO");
+      if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+        strcpy(estadoTemp, "🌡️ DS18B20: ERROR");
+      } else {
+        snprintf(estadoTemp, sizeof(estadoTemp), "🌡️ Temp: %.1f °C", ds18b20Temp);
+      }
+      snprintf(msgText, sizeof(msgText), "🔄 Cambio de estado:\n%s\n%s", estadoPiloto, estadoTemp);
+      sendTelegramMessage(msgText);
+
+      lastMsgSentMillis = now;
+      ultimoEstadoPiloto = pilotoApagado;
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_WIFI, HIGH);
+  } else {
+    digitalWrite(LED_WIFI, LOW);
+  }
+
+  static unsigned long lastTelegramPollMillis = 0;
+  if (now - lastTelegramPollMillis >= 1000) {
+    lastTelegramPollMillis = now;
+    checkTelegramMessages();
+  }
+
+  // --- MODIFICADO: Manejo error DS18B20 - activa MODO AHORRO ---
+  static bool mensajeErrorDS18B20Enviado = false;
+  static bool intentoReinicializacionDS18B20 = false;
+  
+  // ✅ SOLO activar AHORRO si NO está en modo MANUAL
+  if (!ds18b20Detectado || (dsFaultCount >= FAULT_THRESHOLD && !mensajeErrorDS18B20Enviado && !automatico)) {
+  //if (!ds18b20Detectado || (dsFaultCount >= FAULT_THRESHOLD && !mensajeErrorDS18B20Enviado)) {
+    if (!intentoReinicializacionDS18B20) {
+      if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
+        oneWire.reset();
+        sensors.begin();
+        delay(100);
+        sensors.requestTemperatures();
+        delay(1000);
+        xSemaphoreGive(oneWireMutex);
+      }
+      intentoReinicializacionDS18B20 = true;
+    }
+    // MODIFICADO: Mensaje ahora dice MODO AHORRO
+    sendTelegramMessage("⚠️ ERROR: DS18B20 no responde, MODO AHORRO.");
+    mensajeErrorDS18B20Enviado = true;
+    lastMsgSentMillis = now;
+
+    // Activar modo AHORRO en lugar de MANUAL
+    modoAhorro = true;
+    ahorroEncendido = true;
+    ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;
+    ahorroApagadoHasta = 0;
+    automatico = false;
+    setpointTemp = NAN;
+    releOn = false;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH);
+  }
+
+  // ✅ RECUPERACIÓN: Solo si el sensor tiene lectura válida
+  if (dsFaultCount < FAULT_THRESHOLD && mensajeErrorDS18B20Enviado) {
+  sendTelegramMessage("✅ DS18B20 reconectado");
+  mensajeErrorDS18B20Enviado = false;
+  intentoReinicializacionDS18B20 = false;
+  dsFaultCount = 0;  // ← RESET DEL CONTADOR
+  modoAhorro = false;
+
+  // ✅ RE-DETECTAR SENSOR
+  if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
+    ds18b20Count = sensors.getDeviceCount();
+    if (ds18b20Count > 0) {
+      ds18b20Detectado = true;
+      Serial.println("✓ DS18B20 detectado nuevamente");
+    } else {
+      ds18b20Detectado = false;
+      Serial.println("⚠️ DS18B20 aún desconectado");
+    }
+    xSemaphoreGive(oneWireMutex);
+  }
+   
+  lastMsgSentMillis = now;
+}
+
+
+  // NUEVO: LÓGICA DE CONTROL MODO AHORRO
+  if (modoAhorro) {
+    if (ahorroEncendido) {
+      // Fase ENCENDIDA (5 minutos)
+      if (now >= ahorroEncendidoHasta) {
+        // Cambiar a fase APAGADA
+        ahorroEncendido = false;
+        ahorroApagadoHasta = millis() + AHORRO_APAGADO_MS;
+        releOn = true;
+        digitalWrite(RELAY_DRIVER_PIN, LOW);  // Caldera OFF
+        Serial.println("🟡 AHORRO: Cambiando a fase APAGADA (2 horas)");
+        sendTelegramMessage("🟡 MODO AHORRO: Caldera APAGADA por 2 horas");
+      } else {
+        // Mantener caldera ENCENDIDA
+        releOn = false;
+        digitalWrite(RELAY_DRIVER_PIN, HIGH);
+      }
+    } else {
+      // Fase APAGADA (2 horas)
+      if (now >= ahorroApagadoHasta) {
+        // Cambiar a fase ENCENDIDA
+        ahorroEncendido = true;
+        ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;
+        releOn = false;
+        digitalWrite(RELAY_DRIVER_PIN, HIGH);  // Caldera ON
+        Serial.println("🔥 AHORRO: Cambiando a fase ENCENDIDA (5 minutos)");
+        sendTelegramMessage("🔥 MODO AHORRO: Caldera ENCENDIDA por 5 minutos");
+      } else {
+        // Mantener caldera APAGADA
+        releOn = true;
+        digitalWrite(RELAY_DRIVER_PIN, LOW);
+      }
+    }
+  }
+
+  // ✅ CONTROL DEL RELÉ - PROTEGIDO DE SOBRESCRITURAS MANUALES
+  // Solo controlar si NO hay un comando manual reciente Y NO está en AHORRO
+  if ((now - ultimoComandoManual) > PROTECCION_MANUAL_MS && !modoAhorro) {
+    controlarReleAutomatico();
+  }
+
+  delay(10);
+}
+
+void checkWiFiAndNotify() {
+  unsigned long now = millis();
+  if (now - lastWiFiCheck > WIFI_CHECK_INTERVAL) {
+    lastWiFiCheck = now;
+    if (WiFi.status() != WL_CONNECTED) {
+      if (handleDS18B20 != NULL) vTaskSuspend(handleDS18B20);
+      if (!wifiWasConnected) {
+        if (wifiLostSince == 0) wifiLostSince = now;
+        if ((now - wifiLostSince > WIFI_MANUAL_TIMEOUT) && !modoManualPorWiFi) {
+          // MODIFICADO: Activar AHORRO en lugar de MANUAL
+          modoAhorro = true;
+          ahorroEncendido = true;
+          ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;
+          ahorroApagadoHasta = 0;
+          automatico = false;
+          setpointTemp = NAN;
+          releOn = false;
+          digitalWrite(RELAY_DRIVER_PIN, HIGH);
+          modoManualPorWiFi = true;
+          sendTelegramMessage("⚠️ WiFi perdido > 2 min - MODO AHORRO activado.");
+        }
+      } else {
+        wifiLostSince = now;
+        wifiWasConnected = false;
+      }
+      WiFi.reconnect();
+    } else {
+      if (!wifiWasConnected) {
+        sendTelegramMessage("✅ WiFi reconectado");
+        if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(1000))) {
+          oneWire.reset();
+          sensors.begin();
+          delay(100);
+          sensors.requestTemperatures();
+          ds18b20Temp = sensors.getTempCByIndex(0);
+          xSemaphoreGive(oneWireMutex);
+        }
+        if (handleDS18B20 != NULL) vTaskResume(handleDS18B20);
+        
+        if (modoManualPorWiFi) {
+          sendTelegramMessage("ℹ️ Sistema en MODO AHORRO. Envíe /set XX.X para automático");
+          modoManualPorWiFi = false;
+          modoAhorro = false;  // Salir de AHORRO al reconectar
+        }
+        wifiLostSince = 0;
+        wifiWasConnected = true;
+      }
+    }
+  }
+}
+
+// ✅ CONTROL AUTOMÁTICO - NO INTERFIERE CON MANUALES
+void controlarReleAutomatico() {
+  // Si hay error DS18B20, forzar ON
+  if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+    releOn = false;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH);
+    return;
+  }
+
+  // Si NO estamos en automático, respetar el estado manual
+  if (!automatico) {
+    if (releOn) {
+      digitalWrite(RELAY_DRIVER_PIN, LOW);
+    } else {
+      digitalWrite(RELAY_DRIVER_PIN, HIGH);
+    }
+    return;
+  }
+
+  // AUTOMÁTICO: aplicar histéresis
+  if (isnan(setpointTemp)) {
+    releOn = false;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH);
+    return;
+  }
+
+  if (ds18b20Temp < setpointTemp - histeresis) {
+    releOn = false;
+    digitalWrite(RELAY_DRIVER_PIN, HIGH);
+  } else if (ds18b20Temp > setpointTemp + histeresis) {
+    releOn = true;
+    digitalWrite(RELAY_DRIVER_PIN, LOW);
+  }
+}
+
+void checkTelegramMessages() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + String(botToken) +
+               "/getUpdates?offset=" + String(lastUpdateId + 1) + "&limit=1";
+  http.begin(url);
+  int code = http.GET();
+
+  if (code > 0) {
+    String resp = http.getString();
+
+    const size_t capacity = 2048;
+    DynamicJsonDocument doc(capacity);
+    DeserializationError error = deserializeJson(doc, resp);
+
+    if (error) {
+      http.end();
+      return;
+    }
+
+    JsonArray result = doc["result"];
+    if (result.size() == 0) {
+      http.end();
+      return;
+    }
+
+    JsonObject msgObj = result[0];
+    int32_t updId = msgObj["update_id"];
+    JsonObject message = msgObj["message"];
+    int64_t incomingChatId = message["chat"]["id"].as<int64_t>();
+    const char* msgText = message["text"];
+
+    if (!msgText) {
+      http.end();
+      return;
+    }
+
+    int64_t allowedChat = atoll(chatID);
+
+    if (incomingChatId != allowedChat) {
+      http.end();
+      return;
+    }
+
+    lastUpdateId = updId;
+    prefs.putInt("lastId", lastUpdateId);
+
+    String msg = String(msgText);
+    char respuesta[192];
+
+    if (msg == "/estado") {
+      char estadoPiloto[32];
+      char estadoTemp[48];
+      char estadoRele[128];
+
+      if (thermoFaultCount >= FAULT_THRESHOLD || isnan(termocoupleTemp)) {
+        strcpy(estadoPiloto, "⚠️ ERROR: Termocupla");
+      } else {
+        strcpy(estadoPiloto, pilotoApagado ? "⚠️ Piloto APAGADO" : "✅ Piloto ENCENDIDO");
+      }
+
+      if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+        strcpy(estadoTemp, "🌡️ DS18B20: ERROR");
+        if (modoAhorro) {
+          strcpy(estadoRele, "Relé: Según AHORRO\nModo: AHORRO");
+        } else {
+          strcpy(estadoRele, "Relé: ON\nModo: Manual");
+        }
+      } else if (!automatico || isnan(setpointTemp)) {
+        snprintf(estadoTemp, sizeof(estadoTemp), "🌡️ Temp: %.1f °C", ds18b20Temp);
+        if (modoAhorro) {
+          snprintf(estadoRele, sizeof(estadoRele), "Relé: %s (según AHORRO)\nModo: AHORRO",
+            ahorroEncendido ? "ON" : "OFF");
+        } else {
+          snprintf(estadoRele, sizeof(estadoRele), "Relé: %s\nModo: Manual", 
+            releOn ? "OFF" : "ON");
+        }
+      } else {
+        snprintf(estadoTemp, sizeof(estadoTemp), "🌡️ Temp: %.1f °C", ds18b20Temp);
+        snprintf(estadoRele, sizeof(estadoRele),
+          "Relé: %s\nModo: Automático\nSetpoint: %.1f °C",
+          releOn ? "OFF" : "ON",
+          setpointTemp
+        );
+      }
+      snprintf(respuesta, sizeof(respuesta), "%s\n%s\n%s", estadoPiloto, estadoTemp, estadoRele);
+      sendTelegramMessage(respuesta);
+    } 
+    
+    else if (msg.startsWith("/set ")) {
+      float valor = msg.substring(5).toFloat();
+      if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+        // MODIFICADO: Mensaje menciona AHORRO
+        sendTelegramMessage("❌ DS18B20 error - Activando MODO AHORRO");
+        modoAhorro = true;
+        ahorroEncendido = true;
+        ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;
+        ahorroApagadoHasta = 0;
+        automatico = false;
+        setpointTemp = NAN;
+        releOn = false;
+        digitalWrite(RELAY_DRIVER_PIN, HIGH);
+      } else if (valor >= 10.0 && valor <= 35.0) {
+        setpointTemp = valor;
+        automatico = true;
+        modoAhorro = false;  // Salir de AHORRO al activar automático
+        controlarReleAutomatico();
+        snprintf(respuesta, sizeof(respuesta),
+          "✅ Setpoint: %.1f °C\nModo: Automático\nRelé: %s",
+          setpointTemp,
+          releOn ? "OFF" : "ON");
+        sendTelegramMessage(respuesta);
+      } else {
+        sendTelegramMessage("❌ Valor fuera de rango (10-35°C)");
+      }
+    }
+
+    // ✅ COMANDO /rele_off - SIEMPRE ACTIVO
+    else if (msg == "/rele_off") {
+      ultimoComandoManual = millis();
+      modoAhorro = false;  // Salir de AHORRO
+      automatico = false;
+      setpointTemp = NAN;
+      releOn = true;
+      digitalWrite(RELAY_DRIVER_PIN, LOW);
+      
+      Serial.println("✓ /rele_off ejecutado");
+      sendTelegramMessage("⚪ Relé OFF - Caldera apagada (Manual)");
+    }
+    
+    // ✅ COMANDO /rele_on - SIEMPRE ACTIVO
+    else if (msg == "/rele_on") {
+      ultimoComandoManual = millis();
+      modoAhorro = false;  // Salir de AHORRO
+      automatico = false;
+      setpointTemp = NAN;
+      releOn = false;
+      digitalWrite(RELAY_DRIVER_PIN, HIGH);
+      
+      Serial.println("✓ /rele_on ejecutado");
+      sendTelegramMessage("⚫ Relé ON - Caldera encendida (Manual)");
+    }
+    
+    else if (msg == "/termocupla") {
+      if (thermoFaultCount >= FAULT_THRESHOLD) {
+        sendTelegramMessage("⚠️ Termocupla: ERROR");
+      } else {
+        snprintf(respuesta, sizeof(respuesta), "🔥 Termocupla: %.1f °C", termocoupleTemp);
+        sendTelegramMessage(respuesta);
+      }
+    } 
+    
+    else if (msg == "/reiniciar") {
+      snprintf(respuesta, sizeof(respuesta), "♻️ Reiniciando ESP32...\n");
+      char pilotoMsg[48];
+      char tempMsg[48];
+      char modoMsg[48];
+      
+      if (thermoFaultCount >= FAULT_THRESHOLD || isnan(termocoupleTemp)) {
+        snprintf(pilotoMsg, sizeof(pilotoMsg), "⚠️ Termocupla: ERROR");
+      } else {
+        snprintf(pilotoMsg, sizeof(pilotoMsg), pilotoApagado ? "⚠️ Piloto APAGADO" : "✅ Piloto ENCENDIDO");
+      }
+      
+      if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+        snprintf(tempMsg, sizeof(tempMsg), "🌡️ DS18B20: ERROR");
+      } else {
+        snprintf(tempMsg, sizeof(tempMsg), "🌡️ Temp: %.1f °C", ds18b20Temp);
+      }
+      
+      if (modoAhorro) {
+        snprintf(modoMsg, sizeof(modoMsg), "Modo: AHORRO");
+      } else if (automatico) {
+        snprintf(modoMsg, sizeof(modoMsg), "Modo: Automático");
+      } else {
+        snprintf(modoMsg, sizeof(modoMsg), "Modo: Manual");
+      }
+      
+      strncat(respuesta, pilotoMsg, sizeof(respuesta) - strlen(respuesta) - 1);
+      strncat(respuesta, "\n", sizeof(respuesta) - strlen(respuesta) - 1);
+      strncat(respuesta, tempMsg, sizeof(respuesta) - strlen(respuesta) - 1);
+      strncat(respuesta, "\n", sizeof(respuesta) - strlen(respuesta) - 1);
+      strncat(respuesta, modoMsg, sizeof(respuesta) - strlen(respuesta) - 1);
+      sendTelegramMessage(respuesta);
+      delay(1000);
+      ESP.restart();
+    }
+    
+    else {
+      sendTelegramMessage("❓ Comando desconocido.\n/estado, /set XX.X, /rele_off, /rele_on, /termocupla, /reiniciar");
+    }
+  }
+  http.end();
+}
