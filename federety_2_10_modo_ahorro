@@ -498,6 +498,16 @@ void loop() {
 
    // ✅ DETECCIÓN RÁPIDA DE ERROR - Sin esperar al dsFaultCount
   if (isnan(ds18b20Temp) && !mensajeErrorDS18B20Enviado) {
+    unsigned long ahora = millis();
+    
+    // Si hay comando manual RECIENTE, SOLO notifica, NO actives AHORRO
+    if ((ahora - ultimoComandoManual) < 10000) {
+      sendTelegramMessage("⚠️ ERROR: DS18B20 no responde, MODO AHORRO.");
+      mensajeErrorDS18B20Enviado = true;
+      return;  // ← SALE, no activa modoAhorro
+    }
+
+    // Si NO hay manual reciente, ACTIVA AHORRO
     sendTelegramMessage("⚠️ ERROR: DS18B20 no responde, MODO AHORRO.");
     mensajeErrorDS18B20Enviado = true;
     modoAhorro = true;
@@ -630,18 +640,12 @@ void controlarReleAutomatico() {
   }
   
   // Si hay error DS18B20, forzar ON
-  if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
-    releOn = false;
-    digitalWrite(RELAY_DRIVER_PIN, HIGH);
-    return;
-  }
+  // if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
+   // releOn = false;
+   // digitalWrite(RELAY_DRIVER_PIN, HIGH);
+  //  return;
+ // }
    
-  if (!ds18b20Detectado || dsFaultCount >= FAULT_THRESHOLD || isnan(ds18b20Temp)) {
-    releOn = false;
-    digitalWrite(RELAY_DRIVER_PIN, HIGH);
-    return;
-  }
-
   // Si NO estamos en automático, respetar el estado manual
   if (!automatico) {
     if (releOn) {
@@ -734,7 +738,8 @@ void checkTelegramMessages() {
         if (modoAhorro) {
           strcpy(estadoRele, "Relé: Según AHORRO\nModo: AHORRO");
         } else {
-          strcpy(estadoRele, "Relé: ON\nModo: Manual");
+          snprintf(estadoRele, sizeof(estadoRele), "Relé: %s\nModo: Manual", 
+            releOn ? "OFF" : "ON");  // ← Ahora lee releOn
         }
       } else if (!automatico || isnan(setpointTemp)) {
         snprintf(estadoTemp, sizeof(estadoTemp), "🌡️ Temp: %.1f °C", ds18b20Temp);
