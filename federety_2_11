@@ -428,11 +428,24 @@ if (millis() - lastSensorDetectionCheck > 5000) {
   
   if (WiFi.status() == WL_CONNECTED && !ds18b20Detectado) {
     if (oneWireMutex != NULL && xSemaphoreTake(oneWireMutex, pdMS_TO_TICKS(500))) {
+      
+      // ✅ REINICIAR BUS ONEWIRE ANTES DE REDETECTAR
+      oneWire.reset();
+      sensors.begin();
+      delay(100);
+      
+      // ✅ LECTURA DUMMY PARA ESTABILIZAR
+      sensors.requestTemperatures();
+      delay(500);
+      
+      // ✅ AHORA REDETECTAR
       ds18b20Count = sensors.getDeviceCount();
       if (ds18b20Count > 0) {
         ds18b20Detectado = true;
         Serial.println("✓ DS18B20 detectado (redetección periódica)");
+        sendTelegramMessage("✅ DS18B20 detectado");
       }
+      
       xSemaphoreGive(oneWireMutex);
     }
   }
