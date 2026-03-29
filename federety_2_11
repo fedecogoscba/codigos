@@ -520,7 +520,7 @@ void loop() {
   }
 
   // ✅ RECUPERACIÓN
-  if (!isnan(ds18b20Temp) && mensajeErrorDS18B20Enviado) {
+  if (!isnan(ds18b20Temp) && ds18b20Detectado && mensajeErrorDS18B20Enviado) {
     sendTelegramMessage("✅ DS18B20 reconectado");
     mensajeErrorDS18B20Enviado = false;
     dsFaultCount = 0;
@@ -612,7 +612,17 @@ void checkWiFiAndNotify() {
           oneWire.reset();
           sensors.begin();
           delay(100);
+           // ✅ REDETECTAR SENSOR AL RECONECTAR WIFI
+           ds18b20Count = sensors.getDeviceCount();
+           if (ds18b20Count > 0) {
+              ds18b20Detectado = true;
+              Serial.println("✓ DS18B20 redetectado!");  // ← AÑADE PARA DEBUG
+           } else {
+             ds18b20Detectado = false;
+             Serial.println("✗ DS18B20 no encontrado en reconexión");  // ← PARA DEBUG
+           }
           sensors.requestTemperatures();
+          delay(1000);
           ds18b20Temp = sensors.getTempCByIndex(0);
           xSemaphoreGive(oneWireMutex);
         }
