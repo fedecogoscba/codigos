@@ -421,7 +421,6 @@ void loop() {
 
   checkWiFiAndNotify();
   
-  if (handleDS18B20 != NULL) vTaskResume(handleDS18B20);
   // ✅ REDETECTAR SENSOR PERIÓDICAMENTE (cada 5 segundos) SI WIFI ESTÁ CONECTADO
 static unsigned long lastSensorDetectionCheck = 0;
 if (millis() - lastSensorDetectionCheck > 5000) {
