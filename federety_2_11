@@ -619,10 +619,13 @@ void checkWiFiAndNotify() {
         if (handleDS18B20 != NULL) vTaskResume(handleDS18B20);
         
         if (modoManualPorWiFi) {
-          sendTelegramMessage("ℹ️ Sistema en MODO AHORRO. Envíe /set XX.X para automático");
-          modoManualPorWiFi = false;
-          modoAhorro = false;  // Salir de AHORRO al reconectar
-        }
+            sendTelegramMessage("ℹ️ Sistema en MODO AHORRO. Envíe /set XX.X para automático");
+            modoManualPorWiFi = false;
+            modoAhorro = true;  // ← Mantén AHORRO ACTIVO
+            ahorroEncendido = true;  // ← Reinicia a fase ENCENDIDA
+            ahorroEncendidoHasta = millis() + AHORRO_ENCENDIDO_MS;  // ← Reinicia contador
+            ahorroApagadoHasta = 0;
+           }
         wifiLostSince = 0;
         wifiWasConnected = true;
       }
