@@ -554,7 +554,7 @@ if (millis() - lastSensorDetectionCheck > 5000) {
     sendTelegramMessage("✅ DS18B20 reconectado");
     mensajeErrorDS18B20Enviado = false;
     dsFaultCount = 0;
-    modoAhorro = false;
+    // modoAhorro = false;
   }
 
   static unsigned long lastTelegramPollMillis = 0;
